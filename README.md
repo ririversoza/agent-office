@@ -37,7 +37,7 @@ The desktop app shows the pixel office. A terminal session shows the same inform
 Clone the repo anywhere, then load it as a plugin directory:
 
 ```bash
-git clone https://github.com/<you>/agent-office.git ~/.claude/mods/agent-office
+git clone https://github.com/ririversoza/agent-office.git ~/.claude/mods/agent-office
 ```
 
 For one session:
