@@ -1,0 +1,8 @@
+{
+  "name": "agent-office",
+  "version": "0.1.0",
+  "description": "A view-only pixel office pane showing which agents (lead, subagents, Codex, Cursor) are working, with your checklist and this branch's PR",
+  "author": { "name": "Clarisse Versoza" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
