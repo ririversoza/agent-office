@@ -141,9 +141,15 @@ export function applyActivity(list: readonly Worker[], labels: ReadonlyMap<strin
   }, [...list])
 }
 
-/** The id Bash gives a command it moved to the background, from its result; undefined when it ran in the foreground. */
-export function backgroundTaskId(result: unknown): string | undefined {
-  const text = typeof result === 'string' ? result : JSON.stringify(result ?? '')
+/**
+ * The id Bash gives a command it moved to the background; undefined when it ran
+ * in the foreground. Core's Bash record carries it as `backgroundTaskId`; the
+ * text the model reads ("running in background with ID: ...") is the fallback.
+ */
+export function backgroundTaskId(ran: { result?: unknown; text?: string }): string | undefined {
+  const id = (ran.result as { backgroundTaskId?: unknown } | null | undefined)?.backgroundTaskId
+  if (typeof id === 'string' && id) return id
+  const text = ran.text ?? (typeof ran.result === 'string' ? ran.result : '')
   return /running in background with ID:\s*([\w-]+)/.exec(text)?.[1]
 }
 

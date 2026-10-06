@@ -529,7 +529,7 @@ export const register: Register = on => {
     try {
       const ran = await next(e)
       // A Bash call moved to the background returns at once; its agents work until the task's notification.
-      const taskId = externals.length > 0 && input.run_in_background === true ? backgroundTaskId(ran.result) : undefined
+      const taskId = externals.length > 0 && input.run_in_background === true ? backgroundTaskId(ran) : undefined
       if (taskId) {
         backgroundRuns.set(taskId, { externals, startedAt: await $.clock.now() })
         isBackgrounded = true
