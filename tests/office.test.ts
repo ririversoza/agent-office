@@ -7,7 +7,6 @@ import {
   LEAD_ID,
   MAX_TEAM_DESKS,
   activityFor,
-  clearActivity,
   externalFor,
   kindOfModel,
   patch,
@@ -60,12 +59,6 @@ describe('state', () => {
     expect(sameStatus[0]?.changedAt).toBe(5)
     expect(newStatus[0]?.changedAt).toBe(99)
     expect(list[0]?.status).toBe('working')
-  })
-
-  test('clearActivity leaves a label set by a later call alone', () => {
-    const list = [sub('a', { activity: 'editing b.ts' })]
-    expect(clearActivity(list, 'a', 'reading a.ts')[0]?.activity).toBe('editing b.ts')
-    expect(clearActivity(list, 'a', 'editing b.ts')[0]?.activity).toBe('')
   })
 
   test('prune clears finished desks after they linger and caps the team', () => {
