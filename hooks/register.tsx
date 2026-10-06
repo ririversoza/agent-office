@@ -34,15 +34,21 @@ import {
 import { describePanel, fitPanel } from './boards'
 import { paneLayout } from './scene'
 import {
+  ACTIVITY_FLUSH_MS,
+  BACKGROUND_MAX_MS,
   CODEX_ID,
   CURSOR_ID,
   LEAD_ID,
+  type External,
   activityFor,
-  clearActivity,
+  applyActivity,
+  backgroundTaskId,
   clip,
   defaultWorker,
   deskName,
-  externalFor,
+  endedTasks,
+  externalsFor,
+  finishExternals,
   find,
   kindOfModel,
   patch,
@@ -50,6 +56,7 @@ import {
   reconcile,
   sameWorkers,
   shortModel,
+  startExternals,
   upsert,
 } from './state'
 
@@ -115,9 +122,10 @@ async function followPlan($: EngineInterface): Promise<void> {
     return
   }
   if ((await read($, planFile)) !== path) return
-  await update($, checklist, current =>
-    sameBoard(current, plan.board) || !isUnchanged(current, before) ? current : plan.board,
-  )
+  const keepCurrent = (current: Checklist | null) => sameBoard(current, plan.board) || !isUnchanged(current, before)
+  // Every write redraws the pane, so an unchanged plan (most polls) writes nothing.
+  if (keepCurrent(await read($, checklist))) return
+  await update($, checklist, current => (keepCurrent(current) ? current : plan.board))
 }
 
 /** Stops following a plan.json: a newer checklist from elsewhere took over the board. */
@@ -125,9 +133,42 @@ async function stopFollowingPlan($: EngineInterface): Promise<void> {
   await update($, planFile, () => null)
 }
 
+/** Applies `fn` to the desks, writing only when something drawn changes: every write redraws the pane. */
 async function change($: EngineInterface, fn: (list: readonly Worker[], now: number) => Worker[]): Promise<void> {
   const now = await $.clock.now()
+  const current = await read($, workers)
+  if (sameWorkers(current, fn(current, now))) return
   await update($, workers, list => fn(list, now))
+}
+
+/** Activity labels waiting to be drawn, by desk id: written together every ACTIVITY_FLUSH_MS, not per tool call. */
+const pendingActivity = new Map<string, string>()
+
+async function flushActivity($: EngineInterface): Promise<void> {
+  if (pendingActivity.size === 0) return
+  const labels = new Map(pendingActivity)
+  pendingActivity.clear()
+  await change($, (list, now) => applyActivity(list, labels, now))
+}
+
+/** External agents started by a Bash call that went to the background, by its task id, until its notification. */
+const backgroundRuns = new Map<string, { externals: readonly External[]; startedAt: number }>()
+
+async function releaseBackground($: EngineInterface, ended: readonly { id: string; isFailed: boolean }[]): Promise<void> {
+  const runs = ended.flatMap(t => {
+    const run = backgroundRuns.get(t.id)
+    backgroundRuns.delete(t.id)
+    return run ? [{ externals: run.externals, isFailed: t.isFailed }] : []
+  })
+  if (runs.length === 0) return
+  await change($, (list, now) => runs.reduce<Worker[]>((acc, r) => finishExternals(acc, r.externals, now, r.isFailed), [...list]))
+}
+
+/** Releases desks whose background run outlived the longest a Bash background run can last. */
+async function expireBackground($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  const stale = [...backgroundRuns].filter(([, run]) => now - run.startedAt > BACKGROUND_MAX_MS).map(([id]) => ({ id, isFailed: false }))
+  await releaseBackground($, stale)
 }
 
 /** Writes a line to the transcript; if even that fails there is nowhere left to report it. */
@@ -209,6 +250,7 @@ async function openOnce($: EngineInterface): Promise<void> {
 
 /** Catches subagents that ended without a turn.complete we saw, and clears old desks. */
 async function tick($: EngineInterface): Promise<void> {
+  await expireBackground($)
   const agents = await $.agent.list()
   const now = await $.clock.now()
   const current = await read($, workers)
@@ -287,7 +329,9 @@ async function refreshPr($: EngineInterface): Promise<void> {
       note($, `agent-office: could not read the PR for this branch (${error})`)
     }
     if (error) return
-    await update($, pr, () => status)
+    // checkedAt is never drawn: a refresh that found nothing new writes nothing (a write redraws the pane).
+    const drawn = (s: PrStatus | null) => JSON.stringify(s ? { ...s, checkedAt: 0 } : null)
+    if (drawn(await read($, pr)) !== drawn(status)) await update($, pr, () => status)
     if (status && (status.needReply > 0 || status.ci === 'failing')) await openOnce($)
   } finally {
     isRefreshingPr = false
@@ -335,6 +379,9 @@ export const register: Register = on => {
         note($, `agent-office: could not refresh agent statuses (${String(err)})`)
       })
     })
+    $.clock.every(ACTIVITY_FLUSH_MS, () => {
+      flushActivity($).catch(() => undefined)
+    })
     $.clock.every(PR_REFRESH_MS, () => refreshPrQuietly($))
     refreshPrQuietly($)
     return next(e)
@@ -368,6 +415,11 @@ export const register: Register = on => {
   // Checklists Claude writes in its own replies (main loop only: a subagent's
   // working notes would otherwise replace the list the person is following).
   on('session.append', async ($, e, next) => {
+    // A background task's notification frees the desks its run held. Read before
+    // storing, so a row that fails to store still sends Codex and Cursor home.
+    const content = Array.isArray(e.message.content) ? e.message.content : []
+    const ended = endedTasks(textOf(content))
+    if (ended.length > 0) await releaseBackground($, ended)
     const stored = await next(e)
     if (e.door !== 'response' || e.agentId || e.message.role !== 'assistant') return stored
     const found = parseChecklist(withoutCodeFences(textOf(e.message.content)), await $.clock.now(), 'assistant')
@@ -433,6 +485,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId ?? LEAD_ID
     const status: WorkerStatus = !e.agentId ? 'idle' : e.reason === 'error' || e.isAborted ? 'failed' : 'done'
+    pendingActivity.delete(id)
     await change($, (list, now) =>
       e.agentId && !find(list, id) ? [...list] : patch(list, id, { status, activity: '' }, now),
     )
@@ -463,20 +516,24 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const id = e.agentId ?? LEAD_ID
     const input = e as unknown as Record<string, unknown>
-    const label = activityFor(e.tool, input)
-    const external = externalFor(e.tool, input)
+    const externals = externalsFor(e.tool, input)
+    // The label is drawn by the next activity flush and stays until the agent's next call or turn end,
+    // so a run of quick calls is one redraw rather than two per call.
+    pendingActivity.set(id, activityFor(e.tool, input))
+    if (externals.length > 0) {
+      await change($, (list, now) => startExternals(list, externals, now))
+      await openOnce($)
+    }
 
-    await change($, (list, now) => {
-      const isTracked = id === LEAD_ID || find(list, id) !== undefined
-      const withActivity = isTracked ? patch(list, id, { activity: label }, now) : [...list]
-      return external
-        ? patch(withActivity, external.id, { ...external.desk, status: 'working', task: external.task, activity: external.task }, now)
-        : withActivity
-    })
-    if (external) await openOnce($)
-
+    let isBackgrounded = false
     try {
       const ran = await next(e)
+      // A Bash call moved to the background returns at once; its agents work until the task's notification.
+      const taskId = externals.length > 0 && input.run_in_background === true ? backgroundTaskId(ran.result) : undefined
+      if (taskId) {
+        backgroundRuns.set(taskId, { externals, startedAt: await $.clock.now() })
+        isBackgrounded = true
+      }
       const touchedPr = prUrlFromResult(ran.result)
       if (touchedPr) await followPr($, touchedPr)
       else if (e.tool === 'Bash' && typeof input.command === 'string' && PR_CHANGING_COMMAND.test(input.command)) {
@@ -484,10 +541,7 @@ export const register: Register = on => {
       }
       return ran
     } finally {
-      await change($, (list, now) => {
-        const cleared = clearActivity(list, id, label)
-        return external ? patch(cleared, external.id, { status: external.doneStatus, activity: '' }, now) : cleared
-      })
+      if (externals.length > 0 && !isBackgrounded) await change($, (list, now) => finishExternals(list, externals, now))
     }
   })
 

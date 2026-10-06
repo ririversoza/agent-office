@@ -13,8 +13,11 @@ It never acts on its own. It watches the session's hooks and draws what it sees.
 **Desks**
 - **lead:** the main session. It shows *thinking* during a turn, or the tool it's running (Read, Edit, Bash…).
 - **subagents:** a desk per spawned agent, named after its type, with its model family, task and live activity. Desks go ✓ or ✗ when the agent finishes, and are cleared 3 minutes later.
-- **codex:** lights up for `codex exec`, claude-harness's `harness-codex`, and `mcp__codex__*` tool calls.
-- **cursor:** lights up for `cursor-agent`.
+- **codex:** lights up for `codex exec`, claude-harness's `harness-codex` and `codex-diff-review`, and `mcp__codex__*` tool calls.
+- **cursor:** lights up for `cursor-agent` and claude-harness's `cursor-review`.
+- **second-account agents:** claude-harness's `claude-work-agent` runs get a desk per task ("implementer — T7"), and `claude-work-review` a reviewer desk.
+
+Commands Claude starts in the background keep their desks busy until Claude Code reports the task finished, not just until the command is launched.
 
 **Whiteboard** (the current checklist, the newest of):
 - a checklist you paste into a prompt (`- [ ] item`, `- [x] done`, `- [~] in progress`; at least 2 items). Checkboxes inside fenced code blocks are ignored, so PR templates don't count.
@@ -80,6 +83,8 @@ Everything runs locally inside Claude Code. The only outside calls are `gh pr vi
 
 - The PR row reads at most 2,000 review threads and the newest 100 comments per thread.
 - Codex and Cursor are detected from the commands Claude runs, so a CLI started some other way (a wrapper with another name, a different terminal) is not seen.
+- A background run whose finished notification never arrives is released after 2 hours, the longest a background command can run.
+- Activity labels ("reading auth.ts") update at most every 2 seconds. Each change redraws the pane, which on the desktop reloads its frame, so they are batched to avoid flicker.
 - Desk model labels come from the subagent's model. Codex and Cursor desks have no model label, because their CLIs don't report one.
 
 ## Development

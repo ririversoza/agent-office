@@ -8,6 +8,13 @@ export const CURSOR_ID = 'cursor'
 export const DONE_LINGER_MS = 3 * 60_000
 /** Most subagent desks kept; the oldest finished ones go first. */
 export const MAX_TEAM_DESKS = 16
+/**
+ * Activity labels change on every tool call; they are drawn at most this often,
+ * since each state write redraws the pane (a reload of the desktop's frame).
+ */
+export const ACTIVITY_FLUSH_MS = 2_000
+/** Longest a background Bash run can last; a desk waiting on one longer is released. */
+export const BACKGROUND_MAX_MS = 2 * 60 * 60_000
 
 const ACTIVITY_MAX = 18
 
@@ -65,27 +72,88 @@ export type External = {
   desk?: Pick<Worker, 'name' | 'kind' | 'model'>
 }
 
-/** Codex, Cursor or the work-account reviewer behind this call, if any. */
-export function externalFor(tool: string, input: Record<string, unknown>): External | undefined {
+/** What Codex is doing in a Bash command, by the claude-harness wrapper it runs. */
+function codexTask(command: string): string | undefined {
+  if (/\bcodex-diff-review\b/.test(command)) return 'reviewing diff'
+  // claude-harness's plan verifier (codex-sol is its earlier name).
+  if (/\b(?:harness-codex|codex-sol)\b/.test(command)) return 'verifying plan'
+  if (/\bcodex\s+exec\b/.test(command)) return 'reviewing'
+  return undefined
+}
+
+/** A desk per `claude-work-agent <agent> ... --task <id>` the command starts (claude-harness's work account). */
+function workAgents(command: string): External[] {
+  return command.split(/\bclaude-work-agent\b/).slice(1).flatMap(rest => {
+    const agent = rest.trim().split(/\s+/)[0] ?? ''
+    if (!agent || agent.startsWith('-')) return []
+    // A task named by a shell variable ($t) has no literal id: the desk goes by the agent's name.
+    const task = /--task\s+["']?([\w.-]+)/.exec(rest)?.[1]
+    const name = deskName(agent)
+    const kind: WorkerKind = /worker/.test(agent) ? 'sonnet' : 'opus'
+    return [{ id: `work:${task ?? name}`, task: task ?? 'working', doneStatus: 'done' as const, desk: { name, kind, model: `${kind} work` } }]
+  })
+}
+
+/** Every agent outside this session a call puts to work: Codex, Cursor, the work-account reviewer and agents. */
+export function externalsFor(tool: string, input: Record<string, unknown>): External[] {
   if (tool.startsWith('mcp__codex__')) {
     const prompt = typeof input.prompt === 'string' ? input.prompt : ''
-    return { id: CODEX_ID, task: /verif|plan/i.test(prompt) ? 'verifying plan' : 'reviewing', doneStatus: 'idle' }
+    return [{ id: CODEX_ID, task: /verif|plan/i.test(prompt) ? 'verifying plan' : 'reviewing', doneStatus: 'idle' }]
   }
-  if (tool !== 'Bash' || typeof input.command !== 'string') return undefined
+  if (tool !== 'Bash' || typeof input.command !== 'string') return []
   const command = input.command
+  const found: External[] = []
   if (/\bclaude-work-review\b/.test(command)) {
-    return {
-      id: WORK_REVIEW_ID,
-      task: 'reviewing diff',
-      doneStatus: 'done',
-      desk: { name: 'reviewer', kind: 'opus', model: 'opus work' },
-    }
+    found.push({ id: WORK_REVIEW_ID, task: 'reviewing diff', doneStatus: 'done', desk: { name: 'reviewer', kind: 'opus', model: 'opus work' } })
   }
-  if (/cursor-review|cursor-agent/.test(command)) return { id: CURSOR_ID, task: 'reviewing diff', doneStatus: 'idle' }
-  // claude-harness's Codex wrapper (codex-sol is its earlier name).
-  if (/\b(?:harness-codex|codex-sol)\b/.test(command)) return { id: CODEX_ID, task: 'verifying plan', doneStatus: 'idle' }
-  if (/\bcodex\s+exec\b/.test(command)) return { id: CODEX_ID, task: 'reviewing', doneStatus: 'idle' }
-  return undefined
+  if (/\b(?:cursor-review|cursor-agent)\b/.test(command)) found.push({ id: CURSOR_ID, task: 'reviewing diff', doneStatus: 'idle' })
+  const codex = codexTask(command)
+  if (codex) found.push({ id: CODEX_ID, task: codex, doneStatus: 'idle' })
+  return [...found, ...workAgents(command)]
+}
+
+/** The first agent outside this session behind a call, if any. */
+export function externalFor(tool: string, input: Record<string, unknown>): External | undefined {
+  return externalsFor(tool, input)[0]
+}
+
+/** Puts each external agent to work at its desk. */
+export function startExternals(list: readonly Worker[], externals: readonly External[], now: number): Worker[] {
+  return externals.reduce<Worker[]>(
+    (acc, x) => patch(acc, x.id, { ...x.desk, status: 'working', task: x.task, activity: x.task }, now),
+    [...list],
+  )
+}
+
+/** Sends each external agent back: Codex and Cursor to idle, one-off agents to done (or failed). */
+export function finishExternals(list: readonly Worker[], externals: readonly External[], now: number, isFailed = false): Worker[] {
+  return externals.reduce<Worker[]>((acc, x) => {
+    const status: WorkerStatus = isFailed && x.doneStatus === 'done' ? 'failed' : x.doneStatus
+    return patch(acc, x.id, { status, activity: '' }, now)
+  }, [...list])
+}
+
+/** Applies coalesced activity labels to desks still working; others are left alone. */
+export function applyActivity(list: readonly Worker[], labels: ReadonlyMap<string, string>, now: number): Worker[] {
+  return [...labels].reduce<Worker[]>((acc, [id, label]) => {
+    const current = find(acc, id)
+    return current?.status === 'working' ? patch(acc, id, { activity: label }, now) : acc
+  }, [...list])
+}
+
+/** The id Bash gives a command it moved to the background, from its result; undefined when it ran in the foreground. */
+export function backgroundTaskId(result: unknown): string | undefined {
+  const text = typeof result === 'string' ? result : JSON.stringify(result ?? '')
+  return /running in background with ID:\s*([\w-]+)/.exec(text)?.[1]
+}
+
+/** The background tasks a `<task-notification>` row reports as ended, with whether each failed. */
+export function endedTasks(text: string): { id: string; isFailed: boolean }[] {
+  return [...text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)].flatMap(([, body = '']) => {
+    const id = /<task-id>\s*([\w-]+)\s*<\/task-id>/.exec(body)?.[1]
+    const status = /<status>\s*(\w+)\s*<\/status>/.exec(body)?.[1] ?? 'completed'
+    return id ? [{ id, isFailed: status === 'failed' || status === 'killed' }] : []
+  })
 }
 
 export function defaultWorker(id: string, now: number): Worker {
@@ -116,13 +184,6 @@ export function patch(
   const current = find(list, id) ?? defaultWorker(id, now)
   const changedAt = fields.status && fields.status !== current.status ? now : current.changedAt
   return upsert(list, { ...current, ...fields, changedAt })
-}
-
-/** Clear `activity` only if it is still the label this call set. */
-export function clearActivity(list: readonly Worker[], id: string, label: string): Worker[] {
-  const current = find(list, id)
-  if (!current || current.activity !== label) return [...list]
-  return upsert(list, { ...current, activity: '' })
 }
 
 const isFixedDesk = (w: Worker) => w.id === LEAD_ID || w.id === CODEX_ID || w.id === CURSOR_ID
@@ -158,6 +219,7 @@ export function reconcile(
 export function sameWorkers(a: readonly Worker[], b: readonly Worker[]): boolean {
   return a.length === b.length && a.every((w, i) => {
     const o = b[i]
-    return o !== undefined && w.id === o.id && w.status === o.status && w.activity === o.activity && w.task === o.task
+    return o !== undefined && w.id === o.id && w.status === o.status && w.activity === o.activity && w.task === o.task &&
+      w.name === o.name && w.model === o.model && w.kind === o.kind
   })
 }
